@@ -1,0 +1,9 @@
+
+[workspace]
+
+resolver = "2" # Use the 2021 edition resolver
+
+members = [
+    "mpr", # Each crate's name goes here
+    # "crate2"
+]
