@@ -1,8 +1,12 @@
 use clap::{Parser, Subcommand};
 use git2::Repository;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use walkdir::WalkDir;
+use std::io::{self, Write};
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use tokio::sync::mpsc;
+use futures::stream::{self, StreamExt};
 
 /// Command-line arguments for the script
 #[derive(Parser)]
@@ -23,31 +27,63 @@ enum Action {
     Update,
 }
 
-fn main() {
+
+#[tokio::main]
+async fn main() {
     println!("MetaZeta");
 
     let args = Args::parse();
     let base_path = Path::new(&args.path);
 
-    // Walk the directory tree
-    for entry in WalkDir::new(base_path).into_iter().filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if is_git_repo(path) {
-            let full_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-            println!("Found repository: {:?}", full_path);
 
-            if let Some(action) = &args.action {
-                match action {
-                    Action::Pull => pull_repo(&full_path),
-                    Action::Update => {
-                        pull_repo(&full_path);
-                        update_dependencies(&full_path);
-                    }
-                }
-            } else {
-                pull_repo(&full_path);
-                update_dependencies(&full_path);
-            }
+    process_repositories(base_path, &args.action).await;
+}
+
+
+async fn process_repositories(base_path: &Path, action: &Option<Action>) {
+    let (tx, mut rx) = mpsc::channel(32);
+
+    for entry in WalkDir::new(base_path).into_iter().filter_map(|e| e.ok()) {
+
+
+
+        let path = entry.path().to_owned();
+        if is_git_repo(&path) {
+            let tx = tx.clone();
+            let action = action.clone();
+            tokio::spawn(async move {
+                let relative_path = path.strip_prefix(base_path).unwrap_or(&path);
+                process_repository(&path, &action, relative_path).await;
+                tx.send(()).await.unwrap();
+            });
+        }
+    }
+
+    drop(tx);
+
+    while rx.recv().await.is_some() {}
+}
+
+
+async fn process_repository(path: &Path, action: &Option<Action>, relative_path: &Path) {
+    let full_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    println!("Found repository: {:?}", relative_path);
+
+    match action {
+
+        Some(Action::Pull) => pull_repo(&full_path, relative_path).await,
+        Some(Action::Update) => {
+
+
+            pull_repo(&full_path, relative_path).await;
+            update_dependencies(&full_path, relative_path).await;
+        }
+        None => {
+
+
+            pull_repo(&full_path, relative_path).await;
+            update_dependencies(&full_path, relative_path).await;
         }
     }
 }
@@ -58,27 +94,19 @@ fn is_git_repo(path: &Path) -> bool {
 }
 
 /// Pulls the latest changes in the repository
-fn pull_repo(path: &Path) {
-    println!("Pulling repository at {:?}", path);
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("pull")
-        .output()
-        .expect("Failed to execute git pull");
 
-    if !output.status.success() {
-        eprintln!(
-            "Failed to pull {:?}: {}",
-            path,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+
+
+async fn pull_repo(path: &Path, relative_path: &Path) {
+    println!("Pulling repository at {:?}", relative_path);
+    run_command(path, "git", &["pull"], "Git", relative_path).await;
 }
 
 /// Updates dependencies based on lockfiles
-fn update_dependencies(path: &Path) {
-    println!("Updating dependencies for {:?}", path);
+
+
+async fn update_dependencies(path: &Path, relative_path: &Path) {
+    println!("Updating dependencies for {:?}", relative_path);
 
     let mut updated = false;
 
@@ -86,20 +114,29 @@ fn update_dependencies(path: &Path) {
     if path.join("package-lock.json").exists() {
         println!(
             "Detected npm dependencies in {:?}",
-            path.join("package-lock.json")
+
+            relative_path.join("package-lock.json")
         );
-        run_command(path, "npm", &["install"]);
+
+
+        run_command(path, "npm", &["install"], "npm", relative_path).await;
         updated = true;
     } else if path.join("yarn.lock").exists() {
-        println!("Detected Yarn dependencies in {:?}", path.join("yarn.lock"));
-        run_command(path, "yarn", &["install"]);
+
+
+        println!("Detected Yarn dependencies in {:?}", relative_path.join("yarn.lock"));
+
+        run_command(path, "yarn", &["install"], "Yarn", relative_path).await;
         updated = true;
     } else if path.join("pnpm-lock.yaml").exists() {
         println!(
             "Detected pnpm dependencies in {:?}",
-            path.join("pnpm-lock.yaml")
+
+            relative_path.join("pnpm-lock.yaml")
         );
-        run_command(path, "pnpm", &["install"]);
+
+
+        run_command(path, "pnpm", &["install"], "pnpm", relative_path).await;
         updated = true;
     }
 
@@ -107,54 +144,117 @@ fn update_dependencies(path: &Path) {
     if path.join("Cargo.lock").exists() {
         println!(
             "Detected Rust dependencies in {:?}",
-            path.join("Cargo.lock")
+
+            relative_path.join("Cargo.lock")
         );
-        run_command(path, "cargo", &["update"]);
+
+
+        run_command(path, "cargo", &["update"], "Cargo", relative_path).await;
         updated = true;
     }
 
     // Check for Python lockfiles
     if path.join("Pipfile").exists() {
-        println!("Detected Pipenv dependencies in {:?}", path.join("Pipfile"));
-        run_command(path, "pipenv", &["install"]);
+
+
+        println!("Detected Pipenv dependencies in {:?}", relative_path.join("Pipfile"));
+
+        run_command(path, "pipenv", &["install"], "Pipenv", relative_path).await;
         updated = true;
     } else if path.join("poetry.lock").exists() {
         println!(
             "Detected Poetry dependencies in {:?}",
-            path.join("poetry.lock")
+
+            relative_path.join("poetry.lock")
         );
-        run_command(path, "poetry", &["update"]);
+
+
+        run_command(path, "poetry", &["update"], "Poetry", relative_path).await;
         updated = true;
     } else if path.join("requirements.txt").exists() {
         println!(
             "Detected pip dependencies in {:?}",
-            path.join("requirements.txt")
+
+            relative_path.join("requirements.txt")
         );
-        run_command(path, "pip", &["install", "-r", "requirements.txt"]);
+
+
+        run_command(path, "pip", &["install", "-r", "requirements.txt"], "pip", relative_path).await;
         updated = true;
     }
 
     if !updated {
-        println!("No recognized dependency manager found for {:?}", path);
+
+        println!("No recognized dependency manager found for {:?}", relative_path);
     }
 }
 
 /// Helper to run a command in a given directory
-fn run_command(path: &Path, command: &str, args: &[&str]) {
-    let output = Command::new(command)
+
+async fn run_command(path: &Path, command: &str, args: &[&str], prefix: &str, relative_path: &Path) {
+    let mut child = Command::new(command)
         .args(args)
         .current_dir(path)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("Failed to execute command");
 
-    if !output.status.success() {
-        eprintln!(
-            "Failed to run {} in {:?}: {}",
-            command,
-            path,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    } else {
-        println!("Successfully ran {} in {:?}", command, path);
+    let mut stdout = StandardStream::stdout(ColorChoice::Always);
+    let mut stderr = StandardStream::stderr(ColorChoice::Always);
+
+    if let Some(stdout_handle) = child.stdout.take() {
+        let prefix = prefix.to_string();
+
+
+        let relative_path = relative_path.to_path_buf();
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stdout_handle);
+            let mut line = String::new();
+
+
+            while tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await.unwrap() > 0 {
+                print_with_prefix(&mut stdout, &prefix, &line, Color::Green, &relative_path).unwrap();
+                line.clear();
+            }
+        });
     }
+
+    if let Some(stderr_handle) = child.stderr.take() {
+        let prefix = prefix.to_string();
+
+
+        let relative_path = relative_path.to_path_buf();
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr_handle);
+            let mut line = String::new();
+
+
+            while tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await.unwrap() > 0 {
+                print_with_prefix(&mut stderr, &prefix, &line, Color::Red, &relative_path).unwrap();
+                line.clear();
+            }
+        });
+    }
+
+
+    let status = child.wait().await.expect("Failed to wait on child process");
+
+    if !status.success() {
+
+        eprintln!("Failed to run {} in {:?}", command, relative_path);
+    } else {
+
+        println!("Successfully ran {} in {:?}", command, relative_path);
+    }
+}
+
+
+fn print_with_prefix(stream: &mut StandardStream, prefix: &str, message: &str, color: Color, relative_path: &Path) -> io::Result<()> {
+    stream.set_color(ColorSpec::new().set_fg(Some(color)))?;
+
+    write!(stream, "[{}][{}] ", relative_path.display(), prefix)?;
+    stream.reset()?;
+    write!(stream, "{}", message)?;
+    stream.flush()
 }
